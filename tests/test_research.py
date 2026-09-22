@@ -107,7 +107,8 @@ class ResearchTests(unittest.TestCase):
 
     def test_citation_checks_and_zotero_page_link(self):
         sources = [{'path': '/library/ABCD2345/test.pdf', 'page': 9}]
-        self.assertIsNone(r.citation_warning('Evidence [1].', sources))
+        self.assertIsNone(r.citation_warning('Evidence [1, p. 9].', sources))
+        self.assertIsNone(r.citation_warning('Evidence [1].', sources, 'passages'))
         self.assertIsNotNone(r.citation_warning('120 [unreadable PDF symbol]C/s [1]', sources))
         self.assertIsNotNone(r.citation_warning('Evidence [1, 2].', sources))
         self.assertIsNotNone(r.citation_warning('Unsupported answer.', sources))

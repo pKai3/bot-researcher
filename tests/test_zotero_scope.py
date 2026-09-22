@@ -106,6 +106,30 @@ class ScopeTests(unittest.TestCase):
             self.assertTrue(any('Open Zotero' in e.value for e in self.app.error))
             self.assertEqual(len(self.app.chat_input), 0)
 
+    def test_new_sources_group_six_excerpts_into_two_papers_and_preserve_old_answers(self):
+        sources = [
+            {'path': str(self.files[paper]), 'page': page, 'text': f'Excerpt {number}'}
+            for number, (paper, page) in enumerate([(0, 2), (1, 5), (0, 2), (0, 3), (1, 5), (1, 3)])
+        ]
+        self.app.session_state['messages'] = [
+            {'question': 'New summary', 'answer': 'First paper [1, p. 2]. Second paper [2, p. 5].',
+             'sources': sources, 'citation_style': r.CITATION_STYLE},
+            {'question': 'Earlier summary', 'answer': 'Earlier passage [6].', 'sources': sources},
+        ]
+        self.app.run()
+        self.assertFalse(self.app.exception)
+        labels = [e.label for e in self.app.expander if e.label.startswith('[')]
+        self.assertEqual(labels[:2], ['[1] paper · 3 passages', '[2] paper · 3 passages'])
+        self.assertEqual(len(labels), 8)  # Two new paper groups plus six legacy passages.
+        self.assertEqual(labels[-1], '[6] paper · PDF page 3')
+        self.assertTrue(any('6 passages from 2 papers' in c.value for c in self.app.caption))
+        page_headings = [m.value for m in self.app.markdown if m.value.startswith('**[')]
+        self.assertEqual(page_headings, [
+            '**[1, p. 2] · PDF page 2**', '**[1, p. 3] · PDF page 3**',
+            '**[2, p. 3] · PDF page 3**', '**[2, p. 5] · PDF page 5**',
+        ])
+        self.assertFalse(any('invalid source' in w.value for w in self.app.warning))
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -48,7 +48,11 @@ class PaperCitationTests(unittest.TestCase):
         self.assertIsNotNone(r.citation_warning('An imaginary third paper [3, p. 2].', self.sources))
         self.assertIsNotNone(r.citation_warning('A page from the wrong paper [2, p. 2].', self.sources))
         self.assertIsNotNone(r.citation_warning('An unavailable page [1, p. 99].', self.sources))
+        self.assertIsNone(r.citation_warning('Two supplied pages [1, pp. 2–3].', self.sources))
+        self.assertIsNotNone(r.citation_warning('A range containing an unavailable page [2, p. 3-4].', self.sources))
+        self.assertIsNotNone(r.citation_warning('A reversed range [1, pp. 3-2].', self.sources))
         self.assertIsNotNone(r.citation_warning('Uncited claims.', self.sources))
+        self.assertIn('omits PDF page', r.citation_warning('Paper [1]: Findings. Paper [2]: Findings.', self.sources))
 
     def test_legacy_answers_retain_their_six_passage_citations(self):
         self.assertIsNone(r.citation_warning('Earlier answer [6].', self.sources, 'passages'))

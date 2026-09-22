@@ -110,7 +110,14 @@ class Ollama:
         result = self.request('/api/chat', {
             'model': CHAT_MODEL, 'stream': False,
             'messages': [{'role': 'system', 'content': system},
-                         {'role': 'user', 'content': f'EVIDENCE: {len(papers)} PAPERS, {len(sources)} EXCERPTS\n{context}\n\nQUESTION\n{question}'}],
+                         {'role': 'user', 'content': (
+                             f'EVIDENCE: {len(papers)} PAPERS, {len(sources)} EXCERPTS\n{context}\n\nQUESTION\n{question}'
+                             '\n\nANSWER REQUIREMENTS\n'
+                             'Attach a paper-and-page citation to each factual sentence, using the exact '
+                             'citation printed above its supporting excerpt, such as [1, p. 2]. '
+                             'A paper number in a heading alone is not a citation. '
+                             f'If summarizing these papers, write {len(papers)} sections, one per paper, '
+                             'with the filename as each heading. Combine excerpts belonging to the same paper.')}],
             'options': {'temperature': 0.1, 'num_ctx': 8192, 'num_predict': 900},
             'keep_alive': '5m',
         }, timeout=600)
@@ -375,20 +382,24 @@ def citation_warning(answer, sources, citation_style=CITATION_STYLE):
     if '[unreadable PDF symbol]' in answer:
         return 'The answer repeats an unreadable PDF symbol. Verify affected values and units in the original PDF before using them.'
     numbers = [int(n) for group in re.findall(r'\[([\d,\s]+)\]', answer) for n in re.findall(r'\d+', group)]
-    page_citations = [(int(paper), int(page)) for paper, page in
-                      re.findall(r'\[(\d+)\s*,\s*p(?:age)?\.?\s*(\d+)\]', answer, flags=re.I)]
+    page_citations = [(int(paper), int(first), int(last or first)) for paper, first, last in
+                      re.findall(r'\[(\d+)\s*,\s*p(?:p|ages?)?\.?\s*(\d+)(?:\s*[-–—]\s*(\d+))?\]',
+                                 answer, flags=re.I)]
     papers = group_sources(sources)
     paper_style = citation_style == CITATION_STYLE
     if paper_style:
-        numbers.extend(paper for paper, _ in page_citations)
+        numbers.extend(paper for paper, _, _ in page_citations)
     if any(n < 1 or n > (len(papers) if paper_style else len(sources)) for n in numbers):
         return 'The model used an invalid source number. Check the excerpts before relying on this answer.'
     if paper_style:
         pages = {p['number']: {s['page'] for s in p['passages']} for p in papers}
-        if any(page not in pages[paper] for paper, page in page_citations):
+        if any(last < first or sum(first <= page <= last for page in pages[paper]) != last - first + 1
+               for paper, first, last in page_citations):
             return 'The model cited a page that was not supplied for that paper. Check the excerpts before relying on this answer.'
     if not numbers:
         return 'This answer contains no numbered citations. Check the excerpts below.'
+    if paper_style and not page_citations:
+        return 'The answer identifies papers but omits PDF page references. Check the excerpts below for the supporting pages.'
     return None
 
 
