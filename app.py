@@ -3,9 +3,19 @@ import html
 import streamlit as st
 import research as r
 import ocr
+import zotero
 from paper_search import filter_papers
 
 st.set_page_config(page_title='Research Desk', page_icon='📚', layout='wide')
+# These two menus need more room than their sidebar controls. Keep the fixed
+# option heights used by Streamlit's virtual list; widen instead of wrapping.
+st.html('''<style>
+[data-testid="stSelectboxVirtualDropdown"]:has([role="listbox"][aria-label="Zotero library"]),
+[data-testid="stSelectboxVirtualDropdown"]:has([role="listbox"][aria-label="Zotero collection"]) {
+    width: min(44rem, calc(100vw - 2.5rem)) !important;
+    max-width: calc(100vw - 2.5rem);
+}
+</style>''')
 r.initialize()
 client = r.Ollama()
 
@@ -22,7 +32,18 @@ def ocr_languages():
         return [], str(exc)
 
 
-def show_sources(sources, prefix):
+@st.cache_data(ttl=30, show_spinner=False)
+def zotero_libraries():
+    return zotero.LocalZotero().libraries()
+
+
+@st.cache_data(ttl=30, max_entries=8, show_spinner=False)
+def zotero_catalog(library_id):
+    return zotero.LocalZotero().catalog(library_id)
+
+
+def show_passage_sources(sources, prefix):
+    # Older answers used passage numbers; preserve their original citation map.
     for i, source in enumerate(sources, 1):
         path = Path(source['path'])
         with st.expander(f'[{i}] {path.stem} · PDF page {source["page"]}'):
@@ -43,6 +64,37 @@ def show_sources(sources, prefix):
                     st.warning('This PDF has moved. Refresh the library index.')
 
 
+def show_sources(sources, prefix, citation_style):
+    if citation_style != r.CITATION_STYLE:
+        show_passage_sources(sources, prefix)
+        return
+    papers = r.group_sources(sources)
+    st.caption(f'{len(sources)} passages from {len(papers)} papers. Citation numbers identify papers; page numbers locate the evidence.')
+    for paper in papers:
+        path, number = Path(paper['path']), paper['number']
+        with st.expander(f'[{number}] {path.stem} · {len(paper["passages"])} passages'):
+            pages = sorted({s['page'] for s in paper['passages']})
+            for page in pages:
+                excerpts = [s for s in paper['passages'] if s['page'] == page]
+                st.markdown(f'**[{number}, p. {page}] · PDF page {page}**')
+                for excerpt in excerpts:
+                    st.write(excerpt['text'])
+                if any(s.get('ocr') for s in excerpts):
+                    st.caption('Read using OCR. Check numbers, units and equations against the original page.')
+                if any('[unreadable PDF symbol]' in s['text'] for s in excerpts):
+                    st.warning('This page contains a symbol the PDF extractor could not read. Check the original PDF for units, equations and numerical claims.')
+                link = r.zotero_uri(excerpts[0])
+                if link:
+                    st.markdown(f'<a href="{html.escape(link, quote=True)}" target="_self">Open this page in Zotero ↗</a>', unsafe_allow_html=True)
+            st.caption(f'File: {path.name} · Pages counted from the start of the PDF')
+            if st.button('Show PDF download', key=f'{prefix}-paper-prepare-{number}'):
+                try:
+                    st.download_button('Download source PDF', path.read_bytes(), file_name=path.name,
+                                       mime='application/pdf', key=f'{prefix}-paper-download-{number}')
+                except OSError:
+                    st.warning('This PDF has moved. Refresh the library index.')
+
+
 with st.sidebar:
     st.title('Research Desk')
     st.caption('YOUR PAPERS, CLOSE AT HAND')
@@ -50,11 +102,14 @@ with st.sidebar:
     root = str(Path(library).expanduser().resolve())
     if st.button('Refresh library'):
         st.cache_resource.clear()
+        st.cache_data.clear()
         st.rerun()
+    limit_collection = st.checkbox('Limit to a Zotero collection')
+    collection_controls = st.container()
     st.divider()
     st.caption('Mistral 7B · Local answers\n\nNomic Embed · Local document search')
     st.caption('The app reads PDFs without changing them. Its search index stays in this project’s .data folder.')
-    st.caption('This version reads attachment files; it does not import Zotero collections, notes or annotations.')
+    st.caption('Zotero collections can limit your paper selection. Notes and annotations are not imported.')
 
 try:
     files = r.discover(root)
@@ -62,7 +117,52 @@ except r.AssistantError as exc:
     st.error(str(exc))
     st.stop()
 
-all_docs = r.documents(root=root)
+scope_label, group_id = 'All PDFs in the selected folder', None
+if limit_collection:
+    with collection_controls:
+        try:
+            with st.spinner('Reading Zotero collections…'):
+                libraries = zotero_libraries()
+                library_names = {entry['id']: entry['name'] for entry in libraries}
+                # Keep a removed selection visible until the user chooses another;
+                # refreshing must never silently widen the scope.
+                old_library = st.session_state.get('zotero_library')
+                if old_library and old_library not in library_names:
+                    library_names[old_library] = 'Unavailable library — choose another'
+                library_id = st.selectbox('Zotero library', list(library_names),
+                                          format_func=library_names.get, key='zotero_library')
+                st.caption(library_names[library_id])
+                if library_id not in {entry['id'] for entry in libraries}:
+                    raise zotero.ZoteroError('Choose an available Zotero library.')
+                catalog = zotero_catalog(library_id)
+                labels = zotero.collection_labels(catalog['collections'])
+                menu_labels = zotero.collection_labels(catalog['collections'], compact=True)
+                selection_key = f'zotero_collection_{library_id}'
+                old_collection = st.session_state.get(selection_key)
+                if old_collection and old_collection not in labels:
+                    labels[old_collection] = 'Unavailable collection — choose another'
+                    menu_labels[old_collection] = labels[old_collection]
+                collection = st.selectbox('Zotero collection', [None] + sorted(labels, key=lambda k: labels[k].casefold()),
+                                          format_func=lambda key: menu_labels[key] if key else 'Entire Zotero library',
+                                          key=selection_key)
+                if collection:
+                    st.caption(labels[collection])
+                include_children = st.checkbox('Include subcollections', value=True, disabled=collection is None)
+                narrowed = zotero.select_pdfs(files, catalog, collection, include_children)
+                files = narrowed['paths']
+                group_id = next(entry['group_id'] for entry in libraries if entry['id'] == library_id)
+                scope_label = library_names[library_id] + (f' / {labels[collection]}' if collection else '')
+                if collection and include_children:
+                    scope_label += ' (including subcollections)'
+                st.caption(f'{len(files)} local PDFs in this selection. Applies to OCR, indexing and questions.')
+                if narrowed['unavailable']:
+                    st.caption(f'{narrowed["unavailable"]} PDF attachments are not available inside the selected PDF folder. Download them in Zotero or check the folder location.')
+        except zotero.ZoteroError as exc:
+            st.error(str(exc))
+            st.stop()
+
+visible_paths = {str(p) for p in files}
+all_docs = [d for d in r.documents(root=root) if d['path'] in visible_paths]
 key, online, chat_ready = None, False, False
 try:
     models = client.models()
@@ -77,8 +177,9 @@ ready = [d for d in all_docs if key and r.current_document(d) and r.index_compat
 
 st.title('Explore your research library')
 st.write('Ask a focused question. Follow the evidence back to the page.')
+st.caption(f'Paper selection: {scope_label}')
 a, b, c = st.columns(3)
-a.metric('PDFs in library', len(files))
+a.metric('PDFs in selection', len(files))
 b.metric('Papers ready to search', len(ready))
 c.metric('Searchable passages', sum(d['chunks'] for d in ready))
 ask_tab, library_tab = st.tabs(['Ask your papers', 'Library'])
@@ -179,12 +280,16 @@ with ask_tab:
         scope_matches = filter_papers([d['path'] for d in ready], scope_query)['paths']
     scope = st.multiselect('Focus on specific indexed papers (optional)', scope_matches,
                           format_func=lambda p: f'{Path(p).stem} · {Path(p).parent.name}')
-    effective_scope = scope or (scope_matches if scope_query.strip() else None)
+    # Always pass an explicit set of allowed papers. None would search the full
+    # on-disk index and could leak results from outside the chosen collection.
+    effective_scope = scope or scope_matches
     if scope_query.strip():
         st.caption(f'{len(scope_matches)} matching indexed papers. Questions use all matches unless you select specific papers above.')
         if not scope_matches:
             st.info('No indexed papers match this filter. Change the filter, or find and index more papers in Library.')
-    passages = st.slider('Source passages per answer', 3, 8, 6)
+    passages = st.slider('Source passages per answer', 3, 8, 6,
+                         help='Total excerpts to retrieve. Several may come from the same paper. Citations identify the paper and PDF page.')
+    st.caption(f'Searching {len(effective_scope)} papers · Up to {passages} passages total. A paper can contribute more than one passage.')
     search_only = st.checkbox('Find passages without generating an answer')
     st.caption('Ask each question with its full context. Earlier answers are displayed for reference but are not sent to the model.')
     if st.button('Clear conversation'):
@@ -194,11 +299,14 @@ with ask_tab:
         with st.chat_message('user'):
             st.write(message['question'])
         with st.chat_message('assistant'):
+            if message.get('paper_selection'):
+                st.caption(f'Paper selection: {message["paper_selection"]}')
             st.markdown(message['answer'])
-            warning = r.citation_warning(message['answer'], message['sources']) if message['sources'] and not message.get('search_only') else None
+            citation_style = message.get('citation_style', 'passages')
+            warning = r.citation_warning(message['answer'], message['sources'], citation_style) if message['sources'] and not message.get('search_only') else None
             if warning:
                 st.warning(warning)
-            show_sources(message['sources'], f'history-{number}')
+            show_sources(message['sources'], f'history-{number}', citation_style)
     question = st.chat_input('What do these papers say about…?', disabled=not ready or not online or (bool(scope_query.strip()) and not scope_matches) or (not chat_ready and not search_only), max_chars=2000)
     if question:
         try:
@@ -206,10 +314,14 @@ with ask_tab:
                 valid_paths = tuple(sorted(d['path'] for d in ready))
                 corpus = cached_corpus(str(r.DB), root, key, r.revision(), valid_paths)
                 sources = r.retrieve(question, corpus, client, paths=effective_scope, k=passages)
+                if group_id:
+                    sources = [{**source, 'group_id': group_id} for source in sources]
             with st.spinner('Reading the evidence and drafting an answer locally…'):
                 answer = ('Here are the closest matching passages.' if sources else 'No passages found.') if search_only else client.answer(question, sources)
             warning = r.citation_warning(answer, sources) if not search_only and sources else None
-            messages.append({'question': question, 'answer': answer, 'sources': sources, 'warning': warning, 'search_only': search_only})
+            messages.append({'question': question, 'answer': answer, 'sources': sources, 'warning': warning,
+                             'search_only': search_only, 'paper_selection': scope_label,
+                             'citation_style': r.CITATION_STYLE})
             st.rerun()
         except r.AssistantError as exc:
             st.error(str(exc))

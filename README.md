@@ -9,11 +9,13 @@ Double-click **Start Research Assistant.command**, then use **http://127.0.0.1:8
 1. Open **Library** and search by filename or paper content, then choose PDFs or select **All matching papers**. Search is case-insensitive and matches every entered word. It uses Zotero’s available text cache, saved index text, or direct PDF extraction, and works before AI indexing. The first search builds a local text cache; later searches reuse it. Papers without readable text are listed and can still match by filename.
 2. Click **Index selected papers**. OCR is enabled by default when Tesseract is installed and reads pages with little extractable text. Each completed paper is saved; indexing again skips unchanged PDFs.
 3. Open **Ask your papers**. Optionally filter indexed papers by filename or content and choose papers to focus on, then ask a specific question. With a filter active, questions search all matching papers unless you choose a smaller selection.
-4. Expand the numbered sources and choose **Open this page in Zotero** to check the evidence.
+4. Expand the numbered papers and choose **Open this page in Zotero** to check the evidence. Citations identify a paper and its PDF page, for example `[1, p. 2]`.
 
-The default library is `~/Zotero/storage`. You can change the folder in the sidebar. This reads attachment PDFs only: Zotero collections, notes, annotations, linked files outside that folder, and bibliographic metadata are not imported. Source PDFs and Zotero's database are never modified.
+The default library is `~/Zotero/storage`. You can change the folder in the sidebar. The app searches attachment PDFs. Zotero collections can narrow the selection; notes, annotations, linked files outside the selected folder, and bibliographic metadata are not indexed. Source PDFs and Zotero's database are never modified.
 
 Example: “What mechanisms cause grain refinement in titanium alloys? Distinguish nucleation from growth restriction and cite the evidence.”
+
+**Source passages per answer** is the total excerpt budget, not the number of papers. Six passages can come from two papers. The model receives those excerpts grouped under two paper identities, and the source panel groups them the same way. Summaries combine excerpts from each paper into one account; they still cover only the retrieved evidence, not necessarily the whole paper. Older answers retain their original passage-number citations; ask again to use paper-and-page citations.
 
 ## Stop the app
 
@@ -42,6 +44,16 @@ ollama pull mistral:7b
 
 The two model downloads total roughly 4.7 GB. An Apple Silicon Mac with 18 GB memory was used for the initial setup. Indexing the entire library can take time and uses additional disk space proportional to extracted text.
 
+## Limit papers to a Zotero collection
+
+Enable **Limit to a Zotero collection** in the sidebar. Choose **Zotero library** (My Library or a group library), then choose a **Zotero collection**. The dropdown shows short collection names; the full selected path appears underneath, such as `UQ / ENGG7341 Thesis / Ti-Al-Fe`. Duplicate names retain their full paths in the menu. **Include subcollections** is on by default; turn it off for only items directly in the chosen collection.
+
+This selection applies to the PDF list, keyword filters, OCR, indexing, paper counts and AI questions. Existing indexes remain saved, but answers only retrieve passages from the current selection. Earlier answers keep their original selection label. An empty or unavailable collection never falls back to the entire library. Disable the collection filter to return to all PDFs in the selected disk folder.
+
+Keep Zotero running. In **Zotero → Settings → Advanced**, enable **Allow other applications on this computer to communicate with Zotero**. Research Desk uses read-only requests to Zotero's local API at `127.0.0.1:23119`; it does not need a cloud API key or internet access, and does not modify Zotero's database. That Zotero setting allows other local applications to read library data too.
+
+Click **Refresh library** after reorganizing collections or downloading attachments. Collection data is also refreshed within 30 seconds on the next app interaction. Only PDFs already present inside **PDF library folder** are included; missing downloads and attachments outside that folder are counted separately. Normal collections are supported; saved searches and special views such as Trash are not collection choices.
+
 ## OCR for scanned papers
 
 In **Library**, select PDFs and open **OCR for scanned papers**. **Use OCR when indexing** is enabled by default when Tesseract is available. The default language is English (`eng`). Select the languages that match the paper; additional language data can be installed on macOS with `brew install tesseract-lang`. Refresh the app afterward (language availability refreshes within 30 seconds).
@@ -63,7 +75,7 @@ Tesseract is a separate system dependency. `TESSERACT_CMD` can specify its execu
 - Text is split into overlapping passages and embedded with Nomic's `search_document:` prefix. Questions use `search_query:`.
 - SQLite stores text, vectors, source paths, file signatures, and embedding model identity. Updates commit one complete document at a time. Changed or missing files are excluded until reindexed.
 - FAISS ranks normalized vectors by similarity. Exact duplicate passages are removed from retrieved results, though duplicate attachments remain visible as separate indexed files.
-- Mistral reads up to eight retrieved excerpts and is instructed to cite sources and acknowledge missing evidence. Basic checks flag unreadable symbols and missing or out-of-range citation numbers; these do **not** verify that a claim follows from its source.
+- Mistral reads up to eight retrieved excerpts grouped by their source PDF. Each paper has one citation number across all its excerpts; citations also include the PDF page. Basic checks flag unreadable symbols, missing or out-of-range paper numbers, and citations to pages not supplied for that paper; these do **not** verify that a claim follows from its source.
 - The app calls Ollama only at `127.0.0.1:11434`, bypasses HTTP proxies, binds the interface to `127.0.0.1`, and disables Streamlit usage telemetry. Its fixed models run locally. Internet access is needed to install software/download models, not to ask questions afterward.
 
 The implementation uses Ollama's current embedding/chat HTTP interfaces directly, keeping the application small without a LangChain dependency. Embeddings are persisted in SQLite; the FAISS search structure is built in memory, so there is no pickle deserialization.
@@ -74,7 +86,7 @@ The implementation uses Ollama's current embedding/chat HTTP interfaces directly
 
 Scanned pages can be read with the built-in OCR controls. OCR can misread numbers, units and equations; OCR sources are labeled so you can check them against the original. Figures, equations, complex tables, and poor reading order can lose information during text extraction. Recognizable broken glyph codes are replaced with `[unreadable PDF symbol]`, shown with a warning, and the model is instructed not to infer affected units or values. Not every extraction error can be detected. A “blank_pages” count reports pages with too little extractable text. Retrieval selects a small set of excerpts, so answers are not exhaustive literature reviews and may still be wrong. Check sources before using findings in research.
 
-Zotero links use the attachment folder key and target the personal library. Group-library attachments may require opening the PDF manually. PDF downloads are available as a fallback.
+Zotero links use the attachment folder key and target the personal library. When a group library is selected, links target that group. Without collection filtering, group-library attachments may require opening the PDF manually. PDF downloads are available as a fallback.
 
 There is no background watcher. Use **Refresh library** and run indexing again after adding or editing PDFs. Failed papers are listed in the indexing report. If the embedding model changes, reindex before searching.
 
@@ -99,3 +111,5 @@ There is no background watcher. Use **Refresh library** and run indexing again a
 - [pypdf text-extraction limitations](https://pypdf.readthedocs.io/en/stable/user/extract-text.html)
 - [Tesseract OCR usage](https://tesseract-ocr.github.io/tessdoc/Command-Line-Usage.html)
 - [PDFium Python renderer](https://pypdfium2.readthedocs.io/en/stable/python_api.html)
+
+- [Zotero collections](https://www.zotero.org/support/collections_and_tags) and [local API](https://www.zotero.org/support/dev/web_api/v3/local_api)
