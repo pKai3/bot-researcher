@@ -2,6 +2,7 @@ from pathlib import Path
 import html
 import streamlit as st
 import research as r
+import ocr
 from paper_search import filter_papers
 
 st.set_page_config(page_title='Research Desk', page_icon='📚', layout='wide')
@@ -13,11 +14,21 @@ def cached_corpus(db, root, key, revision, valid_paths):
     return r.load_corpus(db, root, key)
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def ocr_languages():
+    try:
+        return ocr.available_languages(), None
+    except ocr.OCRError as exc:
+        return [], str(exc)
+
+
 def show_sources(sources, prefix):
     for i, source in enumerate(sources, 1):
         path = Path(source['path'])
         with st.expander(f'[{i}] {path.stem} · PDF page {source["page"]}'):
             st.write(source['text'])
+            if source.get('ocr'):
+                st.caption('Read using OCR. Check numbers, units and equations against the original page.')
             if '[unreadable PDF symbol]' in source['text']:
                 st.warning('This passage contains a symbol the PDF extractor could not read. Check the original PDF for units, equations and numerical claims.')
             st.caption(f'File: {path.name} · Page counted from the start of the PDF')
@@ -88,7 +99,45 @@ with library_tab:
     mode = st.radio('Papers to index', ['Choose papers', 'All matching papers'], horizontal=True)
     selected = st.multiselect('Choose PDFs', matching, format_func=lambda p: f'{Path(p).name} · {Path(p).parent.name}') if mode == 'Choose papers' else matching
     st.caption(f'{len(selected)} selected · {len(matching)} matching PDFs')
-    if st.button('Index selected papers', type='primary', disabled=not selected or not online):
+    languages, ocr_error = ocr_languages()
+    with st.expander('OCR for scanned papers'):
+        st.write('OCR reads text from page images locally. It saves the recognized text separately and never changes your PDFs. Completed pages are reused when you resume.')
+        if ocr_error:
+            st.warning(ocr_error)
+        use_ocr = st.checkbox('Use OCR when indexing', value=bool(languages), disabled=not languages)
+        chosen_languages = st.multiselect('OCR languages', languages,
+                                         default=['eng'] if 'eng' in languages else languages[:1],
+                                         format_func=lambda code: 'English (eng)' if code == 'eng' else code,
+                                         disabled=not use_ocr)
+        force_ocr = st.checkbox('Read every page with OCR', disabled=not use_ocr,
+                                help='Use for PDFs with a broken text layer or scanned sections that automatic detection misses. This takes longer.')
+        st.caption('Normally, only pages with little readable text use OCR. Select the languages that match the paper. For additional languages on macOS, install tesseract-lang with Homebrew, then refresh.')
+    ocr_options = ocr.Options(tuple(chosen_languages), force_ocr) if use_ocr and chosen_languages else None
+    if use_ocr and not chosen_languages:
+        st.warning('Choose an OCR language to continue.')
+    if st.button('OCR selected papers', disabled=not selected or ocr_options is None,
+                 help='Prepare scanned text for content filters without running the AI index.'):
+        progress = st.progress(0.0)
+        detail = st.empty()
+        report = []
+        for number, path in enumerate(selected):
+            name = Path(path).name
+            def update_page(page, total, action):
+                detail.caption(f'{number+1}/{len(selected)} · {name} · {action} page {page}/{total}')
+            try:
+                result = r.prepare_ocr(path, ocr_options, update_page)
+                report.append({'file': name, **result})
+            except Exception as exc:
+                report.append({'file': name, 'status': 'failed', 'error': str(exc)})
+            progress.progress((number + 1) / len(selected))
+        st.session_state['ocr_report'] = report
+        st.rerun()
+    if 'ocr_report' in st.session_state:
+        report = st.session_state['ocr_report']
+        failures = sum(row['status'] == 'failed' for row in report)
+        st.info(f'Last OCR run: {len(report)-failures} completed, {failures} failed. Recognized text is available to content filters. Index these papers to include it in AI answers.')
+        st.dataframe(report, hide_index=True, width='stretch')
+    if st.button('Index selected papers', type='primary', disabled=not selected or not online or (use_ocr and not chosen_languages)):
         progress = st.progress(0.0)
         detail = st.empty()
         report = []
@@ -96,9 +145,12 @@ with library_tab:
             name = Path(path).name
             def update(done, total):
                 detail.caption(f'{number+1}/{len(selected)} · {name} · passage {done}/{total}')
+            def update_page(page, total, action):
+                detail.caption(f'{number+1}/{len(selected)} · {name} · {action} page {page}/{total}')
             detail.caption(f'{number+1}/{len(selected)} · Reading {name}')
             try:
-                result = r.index_document(path, root, key, client, progress=update)
+                result = r.index_document(path, root, key, client, progress=update,
+                                          ocr_options=ocr_options, page_progress=update_page)
                 report.append({'file': name, **result})
             except Exception as exc:
                 report.append({'file': name, 'status': 'failed', 'error': str(exc)})
@@ -111,10 +163,11 @@ with library_tab:
         failures = sum(row['status'] == 'failed' for row in report)
         st.info(f'Last indexing run: {len(report)-failures} completed or unchanged, {failures} failed.')
         st.dataframe(report, hide_index=True, width='stretch')
-    st.caption('Scanned PDFs need OCR first. Images, plots, equations and complex tables are not interpreted reliably. Pages without enough extracted text are reported as blank_pages.')
+    st.caption('OCR can misread numbers, units and equations. Images, plots and complex tables are not interpreted reliably. Pages still without enough readable text are reported as blank_pages.')
     with st.expander('Indexed papers', expanded=False):
         st.dataframe([{'Paper': Path(d['path']).name, 'Pages': d['pages'], 'Passages': d['chunks'],
                        'Pages without text': d['blank_pages'],
+                       'OCR pages': len(d['ocr_pages']),
                        'Status': 'Ready' if d in ready else 'Needs reindexing / file missing'} for d in all_docs],
                      hide_index=True, width='stretch')
 

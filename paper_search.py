@@ -6,6 +6,7 @@ import sqlite3
 import unicodedata
 
 import research as r
+import ocr
 
 CACHE_DB = r.DATA / 'paper-search.sqlite3'
 
@@ -16,7 +17,7 @@ def normalize(text):
     return ' '.join(text.casefold().split())
 
 
-def filter_papers(files, query, db=r.DB, cache_db=CACHE_DB, progress=None):
+def filter_papers(files, query, db=r.DB, cache_db=CACHE_DB, progress=None, ocr_db=ocr.CACHE_DB):
     """Search all query words literally, regardless of the AI indexing state.
 
     A separate cache avoids holding the embedding database's writer lock while
@@ -27,6 +28,7 @@ def filter_papers(files, query, db=r.DB, cache_db=CACHE_DB, progress=None):
     if not words:
         return {'paths': [str(p) for p in paths], 'searched': 0, 'unavailable': []}
     cached_docs = {d['path']: d for d in r.documents(db) if r.current_document(d)} if Path(db).exists() else {}
+    ocr_revisions = ocr.revisions(ocr_db)
     cache_db = Path(cache_db)
     cache_db.parent.mkdir(parents=True, exist_ok=True)
     matches, unavailable, searched = [], [], 0
@@ -43,9 +45,12 @@ def filter_papers(files, query, db=r.DB, cache_db=CACHE_DB, progress=None):
                 # Zotero may replace a PDF before regenerating its text cache.
                 fresh_cache = cache_stat is not None and cache_stat.st_mtime_ns >= stat.st_mtime_ns
                 doc = cached_docs.get(str(path))
-                signature = json.dumps(['v1', stat.st_size, stat.st_mtime_ns,
+                signature_parts = ['v1', stat.st_size, stat.st_mtime_ns,
                                         [cache_stat.st_size, cache_stat.st_mtime_ns] if fresh_cache else None,
-                                        doc['indexed_at'] if doc else None])
+                                        doc['indexed_at'] if doc else None]
+                if str(path) in ocr_revisions:
+                    signature_parts.append(ocr_revisions[str(path)])
+                signature = json.dumps(signature_parts)
                 saved = con.execute('SELECT text,error FROM paper_text WHERE path=? AND signature=?',
                                     (str(path), signature)).fetchone()
                 if saved:
@@ -63,10 +68,16 @@ def filter_papers(files, query, db=r.DB, cache_db=CACHE_DB, progress=None):
                                 'SELECT text FROM chunks WHERE path=? ORDER BY id', (str(path),)))
                     if not text.strip():
                         try:
-                            chunks, _, _ = r.extract(path)
+                            chunks, _, _ = r.extract(path, ocr_db=ocr_db)
                             text = '\n'.join(c['text'] for c in chunks)
                         except Exception as exc:
                             error = str(exc)
+                    # Add OCR even when Zotero already supplied native text: mixed PDFs
+                    # can have readable cover pages and scanned body pages.
+                    recognized = '\n'.join(ocr.cached_pages(path, ocr_db).values())
+                    if recognized.strip():
+                        text += '\n' + recognized
+                        error = ''
                     text = normalize(text)
                     after = path.stat()
                     if (after.st_size, after.st_mtime_ns) != (stat.st_size, stat.st_mtime_ns):

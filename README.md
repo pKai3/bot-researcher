@@ -7,7 +7,7 @@ A local research assistant for a Zotero PDF library. Search paper excerpts, ask 
 Double-click **Start Research Assistant.command**, then use **http://127.0.0.1:8501**. The launcher starts Ollama and the app when needed and stays active in Terminal. Keep that window open while using Research Desk. Server output appears there; press **Ctrl+C** to shut down. It does not install a login service.
 
 1. Open **Library** and search by filename or paper content, then choose PDFs or select **All matching papers**. Search is case-insensitive and matches every entered word. It uses Zotero’s available text cache, saved index text, or direct PDF extraction, and works before AI indexing. The first search builds a local text cache; later searches reuse it. Papers without readable text are listed and can still match by filename.
-2. Click **Index selected papers**. Each completed paper is saved; indexing again skips unchanged PDFs.
+2. Click **Index selected papers**. OCR is enabled by default when Tesseract is installed and reads pages with little extractable text. Each completed paper is saved; indexing again skips unchanged PDFs.
 3. Open **Ask your papers**. Optionally filter indexed papers by filename or content and choose papers to focus on, then ask a specific question. With a filter active, questions search all matching papers unless you choose a smaller selection.
 4. Expand the numbered sources and choose **Open this page in Zotero** to check the evidence.
 
@@ -26,7 +26,7 @@ If a server was left running by an older launcher, the new launcher connects to 
 Use Python 3.12 or newer and [Ollama](https://ollama.com/download). On this Mac, the project uses Python 3.12 in `.venv`.
 
 ```sh
-brew install ollama
+brew install ollama tesseract
 python3.12 -m venv .venv
 .venv/bin/python -m pip install -r requirements.lock.txt
 OLLAMA_NO_CLOUD=1 ollama serve
@@ -42,9 +42,24 @@ ollama pull mistral:7b
 
 The two model downloads total roughly 4.7 GB. An Apple Silicon Mac with 18 GB memory was used for the initial setup. Indexing the entire library can take time and uses additional disk space proportional to extracted text.
 
+## OCR for scanned papers
+
+In **Library**, select PDFs and open **OCR for scanned papers**. **Use OCR when indexing** is enabled by default when Tesseract is available. The default language is English (`eng`). Select the languages that match the paper; additional language data can be installed on macOS with `brew install tesseract-lang`. Refresh the app afterward (language availability refreshes within 30 seconds).
+
+- **Index selected papers** automatically reads pages with fewer than 80 letters or digits using OCR, then adds their text to the AI index. Previously indexed papers with pages missing text are upgraded when selected again.
+- **OCR selected papers** prepares text for filename/content filters without running Ollama. Index these papers afterward to make their new passages available to AI answers.
+- **Read every page with OCR** handles broken text layers or scanned sections that automatic detection misses. It takes longer; ordinary text extraction is usually more accurate for native PDFs.
+
+Completed OCR pages are cached, including empty pages, so resuming does not repeat them. Failed pages are retried; a failed OCR or embedding run leaves the previously saved AI index intact. Changes to the PDF or selected languages invalidate the applicable cached OCR. Existing readable papers do not need to be reindexed just to enable this feature. Searches reuse cached text and never launch OCR automatically.
+
+OCR operates locally on the CPU. It is intended for printed text, not reliable transcription of handwriting, plots, equations or complex tables. Very poor or sideways scans may still need cleaning or rotation in a separate copy. PDFs with passwords must be unlocked first. Original PDF files and Zotero metadata are never rewritten.
+
+Tesseract is a separate system dependency. `TESSERACT_CMD` can specify its executable path; the app also checks PATH, common Homebrew locations and the standard Windows installation folder. The OCR code uses portable PDFium/Tesseract components; the current launcher and shutdown scripts remain macOS-specific.
+
 ## How it works
 
 - `pypdf` extracts text page by page, preserving one-based **PDF** page numbers (which may differ from printed page labels).
+- PDFium renders scanned pages for local Tesseract OCR. Rendering targets 300 DPI, with a 25-megapixel cap for unusually large pages. Temporary images are deleted after recognition; recognized text is cached one page at a time.
 - Text is split into overlapping passages and embedded with Nomic's `search_document:` prefix. Questions use `search_query:`.
 - SQLite stores text, vectors, source paths, file signatures, and embedding model identity. Updates commit one complete document at a time. Changed or missing files are excluded until reindexed.
 - FAISS ranks normalized vectors by similarity. Exact duplicate passages are removed from retrieved results, though duplicate attachments remain visible as separate indexed files.
@@ -55,9 +70,9 @@ The implementation uses Ollama's current embedding/chat HTTP interfaces directly
 
 ## Local data and limitations
 
-`.data/library.sqlite3` contains extracted text and embeddings. `.data/paper-search.sqlite3` caches normalized text for keyword filtering. Content filters search the available extracted text; unreadable or uncached scanned pages still need OCR. `.data/` and `.venv/` are ignored by Git. No PDFs are copied into the project. Chat history lasts only for the browser session; it is not saved to disk by this app. Each question is independent: include the context it needs.
+`.data/library.sqlite3` contains extracted text and embeddings. `.data/paper-search.sqlite3` caches normalized text for keyword filtering. `.data/ocr.sqlite3` stores recognized text with PDF page numbers, source file signatures and OCR settings. Content filters include cached OCR text, even for papers with both scanned and native pages. `.data/` and `.venv/` are ignored by Git. No PDFs are copied into the project. Chat history lasts only for the browser session; it is not saved to disk by this app. Each question is independent: include the context it needs.
 
-Scanned pages need OCR before indexing. Figures, equations, complex tables, and poor reading order can lose information during text extraction. Recognizable broken glyph codes are replaced with `[unreadable PDF symbol]`, shown with a warning, and the model is instructed not to infer affected units or values. Not every extraction error can be detected. A “blank_pages” count reports pages with too little extractable text. Retrieval selects a small set of excerpts, so answers are not exhaustive literature reviews and may still be wrong. Check sources before using findings in research.
+Scanned pages can be read with the built-in OCR controls. OCR can misread numbers, units and equations; OCR sources are labeled so you can check them against the original. Figures, equations, complex tables, and poor reading order can lose information during text extraction. Recognizable broken glyph codes are replaced with `[unreadable PDF symbol]`, shown with a warning, and the model is instructed not to infer affected units or values. Not every extraction error can be detected. A “blank_pages” count reports pages with too little extractable text. Retrieval selects a small set of excerpts, so answers are not exhaustive literature reviews and may still be wrong. Check sources before using findings in research.
 
 Zotero links use the attachment folder key and target the personal library. Group-library attachments may require opening the PDF manually. PDF downloads are available as a fallback.
 
@@ -69,6 +84,8 @@ There is no background watcher. Use **Refresh library** and run indexing again a
 .venv/bin/python -m unittest discover -s tests -v
 .venv/bin/python manage.py status
 .venv/bin/python manage.py index --match titanium --limit 5
+.venv/bin/python manage.py ocr --match Westly --limit 1
+# Optional: --force-ocr, --ocr-languages eng+deu, or index --no-ocr
 .venv/bin/python -m streamlit run app.py
 ```
 
@@ -80,3 +97,5 @@ There is no background watcher. Use **Refresh library** and run indexing again a
 - [Ollama embedding API](https://docs.ollama.com/api/embed) and [chat API](https://docs.ollama.com/api/chat)
 - [Nomic model and required prefixes](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5)
 - [pypdf text-extraction limitations](https://pypdf.readthedocs.io/en/stable/user/extract-text.html)
+- [Tesseract OCR usage](https://tesseract-ocr.github.io/tessdoc/Command-Line-Usage.html)
+- [PDFium Python renderer](https://pypdfium2.readthedocs.io/en/stable/python_api.html)
