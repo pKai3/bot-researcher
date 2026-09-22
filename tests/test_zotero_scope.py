@@ -47,6 +47,7 @@ class ScopeTests(unittest.TestCase):
         ]:
             self.stack.enter_context(patch(name, replacement))
         for name, result in [
+            ('runtime.refresh_answer_modules', None),
             ('research.initialize', None), ('research.discover', self.files),
             ('research.documents', docs), ('research.current_document', True),
             ('research.load_corpus', corpus), ('research.revision', (3, 1)),
@@ -113,7 +114,9 @@ class ScopeTests(unittest.TestCase):
         ]
         self.app.session_state['messages'] = [
             {'question': 'New summary', 'answer': 'First paper [1, p. 2]. Second paper [2, p. 5].',
-             'sources': sources, 'citation_style': r.CITATION_STYLE},
+             'sources': sources, 'citation_style': r.CITATION_STYLE,
+             'grounding': [{'citation': '[1, p. 2]', 'statement': 'The measured finding.',
+                            'quote': 'Exact supporting text from the source.'}]},
             {'question': 'Earlier summary', 'answer': 'Earlier passage [6].', 'sources': sources},
         ]
         self.app.run()
@@ -123,12 +126,26 @@ class ScopeTests(unittest.TestCase):
         self.assertEqual(len(labels), 8)  # Two new paper groups plus six legacy passages.
         self.assertEqual(labels[-1], '[6] paper · PDF page 3')
         self.assertTrue(any('6 passages from 2 papers' in c.value for c in self.app.caption))
-        page_headings = [m.value for m in self.app.markdown if m.value.startswith('**[')]
+        page_headings = [m.value for m in self.app.markdown if m.value.startswith('**[') and '· PDF page' in m.value]
         self.assertEqual(page_headings, [
             '**[1, p. 2] · PDF page 2**', '**[1, p. 3] · PDF page 3**',
             '**[2, p. 3] · PDF page 3**', '**[2, p. 5] · PDF page 5**',
         ])
         self.assertFalse(any('invalid source' in w.value for w in self.app.warning))
+        self.assertTrue(any(e.label == 'Check supporting quotes' for e in self.app.expander))
+        self.assertTrue(any(t.value == 'Exact supporting text from the source.' for t in self.app.get('text')))
+
+    def test_answer_displays_only_the_sources_used_by_supported_claims(self):
+        def answer(client, question, sources):
+            client.answer_sources = sources[:1]
+            client.answer_evidence = []
+            return 'A supported finding [1, p. 1].'
+        with patch.object(LocalModels, 'answer', answer, create=True):
+            self.app.chat_input[0].set_value('What evidence answers this question?').run()
+        self.assertFalse(self.app.exception)
+        message = self.app.session_state['messages'][-1]
+        self.assertEqual(len(message['sources']), 1)
+        self.assertEqual(len([e for e in self.app.expander if e.label.startswith('[')]), 1)
 
 
 if __name__ == '__main__':

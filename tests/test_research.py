@@ -16,7 +16,7 @@ class FakeEmbeddings:
         self.calls += 1
         if self.fail:
             raise r.AssistantError('model unavailable')
-        return np.array([[1.0, 0.0] if 'titanium' in t else [0.0, 1.0] for t in texts], dtype=np.float32)
+        return np.array([[1.0, 0.0] if 'titanium' in t.lower() else [0.0, 1.0] for t in texts], dtype=np.float32)
 
 
 class ResearchTests(unittest.TestCase):
@@ -70,13 +70,25 @@ class ResearchTests(unittest.TestCase):
             {'path': str(self.paper), 'page': 2, 'text': 'titanium'},
             {'path': str(other), 'page': 7, 'text': 'recycling'},
         ], np.array([[1,0],[1,0],[0,1]], dtype=np.float32))
-        self.assertEqual(len(r.retrieve('titanium', corpus, FakeEmbeddings())), 2)
+        self.assertEqual(len(r.retrieve('titanium', corpus, FakeEmbeddings())), 1)
         self.assertEqual(r.retrieve('titanium', corpus, FakeEmbeddings(), paths=[]), [])
-        found = r.retrieve('titanium', corpus, FakeEmbeddings(), paths=[str(other)])
+        self.assertEqual(r.retrieve('titanium', corpus, FakeEmbeddings(), paths=[str(other)]), [])
+        found = r.retrieve('recycling', corpus, FakeEmbeddings(), paths=[str(other)])
         self.assertEqual(found[0]['page'], 7)
         self.assertEqual(len(found), 1)
         other.unlink()
         self.assertEqual(r.retrieve('titanium', corpus, FakeEmbeddings(), paths=[str(other)]), [])
+
+    def test_retrieval_limit_is_a_maximum_and_weak_matches_do_not_fill_it(self):
+        corpus = r.Corpus([
+            {'path': str(self.paper), 'page': 1, 'text': 'Relevant experimental evidence.'},
+            {'path': str(self.paper), 'page': 2, 'text': 'An unrelated discussion.'},
+        ], np.array([[0.9, 0.436], [0.3, 0.954]], dtype=np.float32))
+        found = r.retrieve('titanium', corpus, FakeEmbeddings(), k=8)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]['page'], 1)
+        corpus.matrix = np.array([[0.3, 0.954], [0.2, 0.98]], dtype=np.float32)
+        self.assertEqual(r.retrieve('titanium', corpus, FakeEmbeddings(), k=8), [])
 
     def test_case_insensitive_pdf_discovery_and_root_boundary(self):
         (self.root / 'ignore.txt').write_text('ignore')

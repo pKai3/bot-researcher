@@ -2,9 +2,17 @@ from pathlib import Path
 import html
 import streamlit as st
 import research as r
+import evidence
+from runtime import refresh_answer_modules
 import ocr
 import zotero
 from paper_search import filter_papers
+
+refresh_answer_modules(evidence, r)
+# Read signatures here as well: app.py reruns even if an older refresh helper
+# remains imported during an update of the helper itself.
+answer_code_revision = tuple((module.__name__, Path(module.__file__).stat().st_mtime_ns)
+                             for module in (evidence, r))
 
 st.set_page_config(page_title='Research Desk', page_icon='📚', layout='wide')
 # These two menus need more room than their sidebar controls. Keep the fixed
@@ -20,7 +28,7 @@ r.initialize()
 client = r.Ollama()
 
 @st.cache_resource(max_entries=2, show_spinner=False)
-def cached_corpus(db, root, key, revision, valid_paths):
+def cached_corpus(db, root, key, revision, valid_paths, evidence_version):
     return r.load_corpus(db, root, key)
 
 
@@ -65,14 +73,19 @@ def show_passage_sources(sources, prefix):
 
 
 def show_sources(sources, prefix, citation_style):
+    if not sources:
+        return
     if citation_style != r.CITATION_STYLE:
         show_passage_sources(sources, prefix)
         return
     papers = r.group_sources(sources)
-    st.caption(f'{len(sources)} passages from {len(papers)} papers. Citation numbers identify papers; page numbers locate the evidence.')
+    passage_label = 'passage' if len(sources) == 1 else 'passages'
+    paper_label = 'paper' if len(papers) == 1 else 'papers'
+    st.caption(f'{len(sources)} {passage_label} from {len(papers)} {paper_label}. Citation numbers identify papers; page numbers locate the evidence.')
     for paper in papers:
         path, number = Path(paper['path']), paper['number']
-        with st.expander(f'[{number}] {path.stem} · {len(paper["passages"])} passages'):
+        label = 'passage' if len(paper['passages']) == 1 else 'passages'
+        with st.expander(f'[{number}] {path.stem} · {len(paper["passages"])} {label}'):
             pages = sorted({s['page'] for s in paper['passages']})
             for page in pages:
                 excerpts = [s for s in paper['passages'] if s['page'] == page]
@@ -287,10 +300,13 @@ with ask_tab:
         st.caption(f'{len(scope_matches)} matching indexed papers. Questions use all matches unless you select specific papers above.')
         if not scope_matches:
             st.info('No indexed papers match this filter. Change the filter, or find and index more papers in Library.')
-    passages = st.slider('Source passages per answer', 3, 8, 6,
-                         help='Total excerpts to retrieve. Several may come from the same paper. Citations identify the paper and PDF page.')
+    passages = st.slider('Maximum source passages', 1, 8, 6,
+                         help='An upper limit, not a target. Answers may use fewer passages or none when evidence is insufficient.')
     st.caption(f'Searching {len(effective_scope)} papers · Up to {passages} passages total. A paper can contribute more than one passage.')
+    st.caption('Passages include surrounding text. Recognizable reference lists are excluded from answer evidence.')
     search_only = st.checkbox('Find passages without generating an answer')
+    if not search_only:
+        st.caption('Only passages supporting the answer are shown. Papers without relevant findings are omitted.')
     st.caption('Ask each question with its full context. Earlier answers are displayed for reference but are not sent to the model.')
     if st.button('Clear conversation'):
         st.session_state['messages'] = []
@@ -306,21 +322,31 @@ with ask_tab:
             warning = r.citation_warning(message['answer'], message['sources'], citation_style) if message['sources'] and not message.get('search_only') else None
             if warning:
                 st.warning(warning)
+            if message.get('grounding'):
+                with st.expander('Check supporting quotes'):
+                    st.caption('Each quote was matched to its cited passage. Check whether it supports the claim; matching text does not verify the interpretation.')
+                    for support in message['grounding']:
+                        st.markdown(f'**{support["citation"]}** {support["statement"]}')
+                        st.text(support['quote'])
             show_sources(message['sources'], f'history-{number}', citation_style)
     question = st.chat_input('What do these papers say about…?', disabled=not ready or not online or (bool(scope_query.strip()) and not scope_matches) or (not chat_ready and not search_only), max_chars=2000)
     if question:
         try:
             with st.spinner('Finding relevant passages in your papers…'):
                 valid_paths = tuple(sorted(d['path'] for d in ready))
-                corpus = cached_corpus(str(r.DB), root, key, r.revision(), valid_paths)
+                corpus = cached_corpus(str(r.DB), root, key, r.revision(), valid_paths,
+                                       (evidence.VERSION, answer_code_revision))
                 sources = r.retrieve(question, corpus, client, paths=effective_scope, k=passages)
                 if group_id:
                     sources = [{**source, 'group_id': group_id} for source in sources]
             with st.spinner('Reading the evidence and drafting an answer locally…'):
                 answer = ('Here are the closest matching passages.' if sources else 'No passages found.') if search_only else client.answer(question, sources)
+                if not search_only:
+                    sources = client.answer_sources
             warning = r.citation_warning(answer, sources) if not search_only and sources else None
             messages.append({'question': question, 'answer': answer, 'sources': sources, 'warning': warning,
                              'search_only': search_only, 'paper_selection': scope_label,
+                             'grounding': getattr(client, 'answer_evidence', []) if not search_only else [],
                              'citation_style': r.CITATION_STYLE})
             st.rerun()
         except r.AssistantError as exc:

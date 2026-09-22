@@ -15,7 +15,13 @@ The default library is `~/Zotero/storage`. You can change the folder in the side
 
 Example: “What mechanisms cause grain refinement in titanium alloys? Distinguish nucleation from growth restriction and cite the evidence.”
 
-**Source passages per answer** is the total excerpt budget, not the number of papers. Six passages can come from two papers. The model receives those excerpts grouped under two paper identities, and the source panel groups them the same way. Summaries combine excerpts from each paper into one account; they still cover only the retrieved evidence, not necessarily the whole paper. Older answers retain their original passage-number citations; ask again to use paper-and-page citations.
+**Maximum source passages** is an upper limit on candidate evidence, not a target number of results or papers. Weak similarity matches are excluded, and generated claims must be marked as directly relevant to the question and have matched supporting quotes. Only passages supporting retained claims appear under an answer. Summaries omit papers with no relevant supported claims; they do not add “no information found” sections. If nothing qualifies, the app gives one insufficient-evidence response. Six passages can come from two papers. Summaries still cover only retrieved evidence, not necessarily the whole paper. Older answers retain their original source mapping; ask again to use the current behavior.
+
+Search still uses small indexed chunks to find relevant text, but answers receive larger surrounding passages from the same PDF page (up to 3,600 characters each, sharing an 18,000-character budget). Overlapping hits are combined instead of being repeated. Recognizable reference lists are excluded before ranking, including continuations on later pages. Text before a references heading is retained; recognizable appendix or methods headings resume body evidence. This works with existing indexes without reindexing. Topic questions receive a direct synthesis; only explicit paper-summary requests use a summary per paper. The model is instructed to distinguish the paper's own findings from earlier work it discusses.
+
+New answers require a supporting quote and passage ID for each claim. The app checks that the quote occurs in that passage (allowing whitespace and PDF ligature normalization), rejects unmatched quotes, and assigns the paper/page citation itself. Open **Check supporting quotes** to inspect each claim beside its quote. This verifies where the quote came from, **not** whether the model interpreted it correctly. A model can still misread an authentic quote, and the extracted PDF text itself may contain errors. If no claims pass, the app abstains instead of showing the raw draft.
+
+After an app update, refresh the browser and ask a new question. The app checks for changed answer-code modules on rerun, so a missed file-watcher event cannot keep an older answer engine silently active. Existing chat answers retain their original content. These retrieval and answer changes do not require reindexing.
 
 ## Stop the app
 
@@ -75,7 +81,8 @@ Tesseract is a separate system dependency. `TESSERACT_CMD` can specify its execu
 - Text is split into overlapping passages and embedded with Nomic's `search_document:` prefix. Questions use `search_query:`.
 - SQLite stores text, vectors, source paths, file signatures, and embedding model identity. Updates commit one complete document at a time. Changed or missing files are excluded until reindexed.
 - FAISS ranks normalized vectors by similarity. Exact duplicate passages are removed from retrieved results, though duplicate attachments remain visible as separate indexed files.
-- Mistral reads up to eight retrieved excerpts grouped by their source PDF. Each paper has one citation number across all its excerpts; citations also include the PDF page. Basic checks flag unreadable symbols, missing or out-of-range paper numbers, and citations to pages not supplied for that paper; these do **not** verify that a claim follows from its source.
+- Reference filtering uses section headings and bibliographic entry structure. It does not remove ordinary inline citations. It can miss unusual reference layouts or OCR errors; filtering is not proof that every remaining statement is an original finding. Internal reference numbers are labeled separately in the model context so they are not confused with PDF pages.
+- Mistral reads up to eight expanded passages grouped by their source PDF and returns structured claims with verbatim supporting quotes. The app matches quotes and renders paper/page citations from source metadata. Earlier answers retain basic citation checks. Neither check verifies that a claim logically follows from its source.
 - The app calls Ollama only at `127.0.0.1:11434`, bypasses HTTP proxies, binds the interface to `127.0.0.1`, and disables Streamlit usage telemetry. Its fixed models run locally. Internet access is needed to install software/download models, not to ask questions afterward.
 
 The implementation uses Ollama's current embedding/chat HTTP interfaces directly, keeping the application small without a LangChain dependency. Embeddings are persisted in SQLite; the FAISS search structure is built in memory, so there is no pickle deserialization.
@@ -107,6 +114,7 @@ There is no background watcher. Use **Refresh library** and run indexing again a
 
 - [Original article](https://medium.com/@itzcharles03/build-a-local-llm-powered-research-assistant-in-minutes-76ac70b0b64f)
 - [Ollama embedding API](https://docs.ollama.com/api/embed) and [chat API](https://docs.ollama.com/api/chat)
+- [Ollama structured outputs](https://docs.ollama.com/capabilities/structured-outputs)
 - [Nomic model and required prefixes](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5)
 - [pypdf text-extraction limitations](https://pypdf.readthedocs.io/en/stable/user/extract-text.html)
 - [Tesseract OCR usage](https://tesseract-ocr.github.io/tessdoc/Command-Line-Usage.html)

@@ -16,6 +16,7 @@ import faiss
 import numpy as np
 from pypdf import PdfReader
 import ocr
+import evidence
 
 PROJECT = Path(__file__).resolve().parent
 DATA = PROJECT / '.data'
@@ -77,14 +78,24 @@ class Ollama:
         return np.ascontiguousarray(vectors / norms, dtype=np.float32)
 
     def answer(self, question, sources):
+        self.answer_evidence = []
+        self.answer_sources = []
         if not sources:
-            return 'No indexed passages are available for this question. Add papers in Library first.'
-        papers = group_sources(sources)
+            return 'I could not find sufficiently relevant passages for this question in the selected indexed papers.'
+        papers = group_sources([{**source, 'passage_id': i} for i, source in enumerate(sources, 1)])
+        summary_request = evidence.asks_for_paper_summaries(question)
+        answer_task = (
+            'Extract findings for ONE summary per PAPER with relevant evidence, combining its excerpts. '
+            'Skip papers that do not contribute a supported answer. Never enumerate excerpts as papers.'
+            if summary_request else
+            'Answer the QUESTION directly, organizing by the relevant findings or mechanisms. '
+            'Synthesize evidence across papers where appropriate. Do not write a summary of each paper. '
+            'Omit excerpts that do not help answer the question.')
         context = '\n\n'.join(
             f'PAPER [{paper["number"]}]: {Path(paper["path"]).name}\n'
             'The following excerpts all belong to this one paper:\n' + '\n\n'.join(
-                f'PDF page {s["page"]} — cite [{paper["number"]}, p. {s["page"]}]'
-                f'{" | OCR text: check numbers and symbols against the original" if s.get("ocr") else ""}\n{s["text"]}'
+                f'PASSAGE {s["passage_id"]} | PDF page {s["page"]} — cite [{paper["number"]}, p. {s["page"]}]'
+                f'{" | OCR text: check numbers and symbols against the original" if s.get("ocr") else ""}\n{evidence.label_internal_citations(s["text"])}'
                 for s in paper['passages'])
             for paper in papers)
         system = (
@@ -93,15 +104,30 @@ class Ollama:
             f'There are exactly {len(papers)} distinct papers represented by {len(sources)} excerpts. '
             'A PAPER number identifies one PDF, not one excerpt. Multiple pages or excerpts under '
             'the same PAPER heading are from the SAME paper and are not independent studies. '
-            'For a request to summarize the papers, give ONE summary per PAPER heading, combining '
-            'its excerpts; use the paper filename as its heading. Never enumerate excerpts as papers. '
-            'Cite every factual claim with the paper number and supplied PDF page, like [1, p. 2]. '
-            'Use separate brackets when citing multiple pages or papers. '
-            'Use only the paper numbers and pages supplied. If the evidence does not answer the question, '
-            'say that explicitly; do not guess or fill gaps from memory. '
+            f'{answer_task} '
+            'Return JSON matching the supplied schema, with at most six concise claims. '
+            'This is a maximum, not a quota: one claim or no claims is acceptable. '
+            'Set relevance to direct only when the quoted passage helps answer the specific QUESTION. '
+            'Sharing a broad subject (such as titanium) without addressing the requested topic is background or unrelated. '
+            'Omit background-only material and per-paper statements that a topic was not mentioned. '
+            'Never infer that a whole paper lacks information from a few retrieved excerpts. '
+            'Each claim must have one statement, a PASSAGE ID, and one continuous verbatim quote '
+            '(40 to 900 characters) from that exact passage that supports the entire statement. '
+            'Do not put citations, paper numbers, or invented paper titles inside statements; '
+            'the app will assign citations from the verified quote location. '
+            'A quote must preserve words, numbers, units, uncertainty, and attribution exactly. '
+            'Do not combine disconnected sentences into a quote or add ellipses. '
+            'If no passage supports a claim, omit it. Return an empty claims array if evidence is insufficient. '
             'Distinguish findings from speculation. Be concise. Do not claim to have read full papers. '
-            'An excerpt containing only references is not evidence that the whole paper lacks findings; '
-            'say that the available excerpts are insufficient instead. '
+            'A bibliography entry or cited title is NOT evidence of the containing paper\'s methods or results. '
+            'Statements attributed to other authors, earlier work, or the paper\'s own reference numbers '
+            'are PRIOR WORK discussed by this paper. Say "the paper reports earlier work..."; '
+            'never recast them as this paper\'s experiment or as an original source you have read. '
+            'Only call a result this paper\'s finding when the excerpt explicitly establishes that. '
+            'If attribution is unclear, say so. Do not infer a paper\'s subject from a cited title. '
+            'The paper\'s internal reference numbers are not PDF page numbers or app citation numbers. '
+            'Numeric brackets from the PDF are shown as ⟦...⟧. They are source notation (often references), '
+            'not your citation IDs or page numbers. Do not expand abbreviations unless the excerpts define them. '
             'OCR excerpts may misread letters, numbers, units and equations; do not silently correct them. '
             'Do not invent titles, authors, numerical results, or references. '
             'If an excerpt contains [unreadable PDF symbol], do not quote or infer a numerical value, '
@@ -109,21 +135,26 @@ class Ollama:
         )
         result = self.request('/api/chat', {
             'model': CHAT_MODEL, 'stream': False,
+            'format': evidence.ANSWER_SCHEMA,
             'messages': [{'role': 'system', 'content': system},
                          {'role': 'user', 'content': (
                              f'EVIDENCE: {len(papers)} PAPERS, {len(sources)} EXCERPTS\n{context}\n\nQUESTION\n{question}'
                              '\n\nANSWER REQUIREMENTS\n'
-                             'Attach a paper-and-page citation to each factual sentence, using the exact '
-                             'citation printed above its supporting excerpt, such as [1, p. 2]. '
-                             'A paper number in a heading alone is not a citation. '
-                             f'If summarizing these papers, write {len(papers)} sections, one per paper, '
-                             'with the filename as each heading. Combine excerpts belonging to the same paper.')}],
-            'options': {'temperature': 0.1, 'num_ctx': 8192, 'num_predict': 900},
+                             f'{answer_task} '
+                             'Separate this study\'s observations from prior work it discusses. '
+                             'For attribution choose own_result, prior_work, interpretation, or unclear. '
+                             'Use only what the excerpts establish. Copy each supporting quote exactly, '
+                             'and identify the PASSAGE containing that quote.\nJSON SCHEMA\n' +
+                             json.dumps(evidence.ANSWER_SCHEMA))}],
+            'options': {'temperature': 0, 'num_ctx': 8192, 'num_predict': 2000},
             'keep_alive': '5m',
         }, timeout=600)
-        answer = result.get('message', {}).get('content', '').strip()
-        if not answer:
-            raise AssistantError('The model returned an empty answer. Please try again.')
+        try:
+            payload = json.loads(result.get('message', {}).get('content', ''))
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise AssistantError('The model did not finish a verifiable answer. Try fewer source passages or a narrower question.') from exc
+        answer, self.answer_evidence = evidence.grounded_answer(payload, sources, summary_request)
+        self.answer_sources = evidence.supporting_sources(sources, self.answer_evidence)
         return answer
 
 
@@ -337,12 +368,17 @@ def load_corpus(db, root, embedding_key):
     for row in rows:
         row['text'] = clean_pdf_text(row['text'])
         row['ocr'] = row['page'] in extracted.get(row['path'], set())
-    matrix = np.stack([np.frombuffer(r.pop('vector'), dtype='<f4') for r in rows])
-    return Corpus(rows, np.ascontiguousarray(matrix, dtype=np.float32))
+    body_rows = [row for _, row in evidence.filter_rows(rows)]
+    if not body_rows:
+        return Corpus([], np.empty((0, 0), dtype=np.float32))
+    matrix = np.stack([np.frombuffer(r.pop('vector'), dtype='<f4') for r in body_rows])
+    return Corpus(body_rows, np.ascontiguousarray(matrix, dtype=np.float32))
 
 
 def retrieve(question, corpus, client, paths=None, k=6):
-    allowed = set(paths) if paths is not None else None
+    if k < 1:
+        return []
+    allowed = {str(path) for path in paths} if paths is not None else None
     indexes = [i for i, r in enumerate(corpus.rows) if (allowed is None or r['path'] in allowed)]
     if not indexes:
         return []
@@ -353,15 +389,46 @@ def retrieve(question, corpus, client, paths=None, k=6):
     index = faiss.IndexFlatIP(vectors.shape[1])
     index.add(vectors)
     scores, found = index.search(query, min(len(indexes), max(k * 12, 72)))
-    result, seen = [], set()
+    page_rows = {}
+    for i in indexes:
+        row = corpus.rows[i]
+        page_rows.setdefault((row['path'], row['page']), []).append((i, row))
+    width = min(evidence.MAX_PASSAGE_CHARS, evidence.CONTEXT_CHAR_BUDGET // k)
+    result, seen, contexts, windows = [], set(), {}, {}
     for score, local_id in zip(scores[0], found[0]):
-        row = corpus.rows[indexes[int(local_id)]]
+        if score < evidence.MIN_RETRIEVAL_SCORE:
+            break
+        row_id = indexes[int(local_id)]
+        row = corpus.rows[row_id]
         # Repeated Zotero attachments must not crowd out independent evidence.
         key = hashlib.sha256(row['text'].encode()).digest()
         if key in seen or not Path(row['path']).is_file():
             continue
         seen.add(key)
-        result.append({**row, 'score': float(score)})
+        page_key = (row['path'], row['page'])
+        if page_key not in contexts:
+            contexts[page_key] = evidence.page_context(page_rows[page_key])
+        page_text, spans = contexts[page_key]
+        start, end = evidence.surrounding_passage(page_text, spans[row_id], width)
+        existing = windows.setdefault(page_key, [])
+        overlap = next(((a, b, source) for a, b, source in existing if start < b and a < end), None)
+        if overlap:
+            a, b, source = overlap
+            # Consolidate nearby hits instead of presenting the same context
+            # multiple times. Larger unions remain separate retrieval targets
+            # for a more specific follow-up question.
+            if max(b, end) - min(a, start) <= width:
+                source['text'] = page_text[min(a, start):max(b, end)].strip()
+                source['context_expanded'] = True
+                existing.remove(overlap)
+                existing.append((min(a, start), max(b, end), source))
+            continue
+        source = {**row, 'text': page_text[start:end].strip(), 'score': float(score),
+                  'context_expanded': end - start > len(row['text']) + 50}
+        if any(s['text'] == source['text'] for s in result):
+            continue
+        result.append(source)
+        existing.append((start, end, source))
         if len(result) >= k:
             break
     return result
@@ -382,11 +449,14 @@ def citation_warning(answer, sources, citation_style=CITATION_STYLE):
     if '[unreadable PDF symbol]' in answer:
         return 'The answer repeats an unreadable PDF symbol. Verify affected values and units in the original PDF before using them.'
     numbers = [int(n) for group in re.findall(r'\[([\d,\s]+)\]', answer) for n in re.findall(r'\d+', group)]
+    page_pattern = r'\[(\d+)\s*,\s*p(?:p|ages?)?\.?\s*(\d+)(?:\s*[-–—]\s*(\d+))?\]'
     page_citations = [(int(paper), int(first), int(last or first)) for paper, first, last in
-                      re.findall(r'\[(\d+)\s*,\s*p(?:p|ages?)?\.?\s*(\d+)(?:\s*[-–—]\s*(\d+))?\]',
-                                 answer, flags=re.I)]
+                      re.findall(page_pattern, answer, flags=re.I)]
     papers = group_sources(sources)
     paper_style = citation_style == CITATION_STYLE
+    if paper_style and any(not re.fullmatch(page_pattern, citation, flags=re.I)
+                           for citation in re.findall(r'\[\d+\s*,\s*p[^\]]*\]', answer, flags=re.I)):
+        return 'The answer contains an ambiguous page citation. Check the excerpts; a paper\'s internal reference numbers are not PDF pages.'
     if paper_style:
         numbers.extend(paper for paper, _, _ in page_citations)
     if any(n < 1 or n > (len(papers) if paper_style else len(sources)) for n in numbers):
