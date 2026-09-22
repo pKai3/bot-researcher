@@ -1,0 +1,13 @@
+[server]
+address = "127.0.0.1"
+port = 8501
+headless = true
+[browser]
+gatherUsageStats = false
+[theme]
+base = "light"
+primaryColor = "#26756b"
+backgroundColor = "#f8f7f3"
+secondaryBackgroundColor = "#eeede7"
+textColor = "#22332f"
+font = "sans serif"

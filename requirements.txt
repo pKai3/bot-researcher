@@ -1,0 +1,5 @@
+streamlit>=1.50,<2
+pypdf[crypto]>=6,<7
+numpy>=2,<3
+faiss-cpu>=1.12,<2
+fonttools>=4,<5
