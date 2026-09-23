@@ -62,11 +62,6 @@ class EvidenceTests(unittest.TestCase):
         self.assertNotIn('[7, 8]', labeled)
         self.assertIn('⟦100⟧', evidence.label_internal_citations('A [100] crystal direction.'))
 
-    def test_only_explicit_paper_summary_requests_use_per_paper_format(self):
-        for question in ['Summarize these papers.', 'Give me a summary of both studies.']:
-            self.assertTrue(evidence.asks_for_paper_summaries(question))
-        for question in ['Lanthanum behaviour in titanium?', 'Summarize lanthanum behaviour.', 'Compare the mechanisms reported by these papers.']:
-            self.assertFalse(evidence.asks_for_paper_summaries(question))
 
 
 class EvidenceIndexTests(unittest.TestCase):
@@ -122,79 +117,6 @@ class EvidenceIndexTests(unittest.TestCase):
         found = r.retrieve('titanium', r.load_corpus(self.db, self.root, 'model-v1'), fixtures.FakeEmbeddings())
         self.assertEqual(len(found), 2)
         self.assertFalse(any('first page' in row['text'] and 'next page' in row['text'] for row in found))
-
-
-class GroundingTests(unittest.TestCase):
-    def setUp(self):
-        self.sources = [
-            {'path': '/a.pdf', 'page': 2, 'text': 'We measured a reduction in grain size in the current experiment.'},
-            {'path': '/b.pdf', 'page': 31, 'text': 'Several researchers have reported grain refinement through lanthanum oxide additions.'},
-        ]
-
-    def claim(self, passage=1, quote=None):
-        return {'statement': 'Grain refinement was observed.', 'passage': passage,
-                'quote': quote or self.sources[0]['text'], 'attribution': 'own_result', 'relevance': 'direct'}
-
-    def test_app_assigns_paper_and_page_from_the_matched_passage(self):
-        answer, support = evidence.grounded_answer({'claims': [self.claim(2, self.sources[1]['text'])]}, self.sources)
-        self.assertIn('[1, p. 31]', answer)
-        self.assertNotIn('[2, p. 31]', answer)
-        self.assertEqual(support[0]['path'], '/b.pdf')
-        self.assertIn('Prior work discussed in the source', answer)
-        self.assertEqual(support[0]['attribution'], 'prior_work')
-
-    def test_wrong_source_and_invented_quotes_are_omitted(self):
-        claims = [self.claim(), self.claim(2), self.claim(99),
-                  self.claim(1, 'An invented quotation about a different and unsupported result.')]
-        answer, support = evidence.grounded_answer({'claims': claims}, self.sources)
-        self.assertEqual(len(support), 1)
-        self.assertIn('Some draft statements were omitted', answer)
-        self.assertNotIn('[2, p. 31]', answer)
-
-    def test_failed_grounding_abstains_instead_of_falling_back_to_raw_model_text(self):
-        answer, support = evidence.grounded_answer({'claims': [self.claim(99)]}, self.sources)
-        self.assertEqual(support, [])
-        self.assertIn('could not find sufficiently relevant evidence', answer)
-
-    def test_wrong_passage_id_is_resolved_only_by_a_unique_matching_quote(self):
-        answer, support = evidence.grounded_answer({'claims': [self.claim(2)]}, self.sources)
-        self.assertEqual(len(support), 1)
-        self.assertIn('[1, p. 2]', answer)
-        self.assertNotIn('[2, p. 31]', answer)
-        self.sources.extend([{**self.sources[0], 'path': '/duplicate.pdf'}])
-        _, support = evidence.grounded_answer({'claims': [self.claim(2)]}, self.sources)
-        self.assertEqual(support, [])
-
-    def test_quote_normalization_preserves_values_but_accepts_pdf_ligatures_and_spacing(self):
-        self.sources[0]['text'] = 'The re ﬁned grain size was 120 micrometres in this test [ 21].'
-        _, support = evidence.grounded_answer({'claims': [self.claim(1, 'The refined grain size was 120 micrometres in this test ⟦21⟧.')]}, self.sources)
-        self.assertEqual(len(support), 1)
-        self.assertEqual(support[0]['quote'], self.sources[0]['text'])
-        _, support = evidence.grounded_answer({'claims': [self.claim(1, 'The refined grain size was 140 micrometres in this test ⟦21⟧.')]}, self.sources)
-        self.assertEqual(support, [])
-
-    def test_summaries_skip_papers_without_relevant_claims_and_renumber_sources(self):
-        answer, claims = evidence.grounded_answer({'claims': [self.claim(2, self.sources[1]['text'])]}, self.sources, summaries=True)
-        self.assertNotIn('a.pdf', answer)
-        self.assertNotIn('did not yield', answer)
-        self.assertIn('### [1] b', answer)
-        self.assertEqual(evidence.supporting_sources(self.sources, claims), [self.sources[1]])
-
-    def test_background_and_no_mention_filler_are_not_returned_as_claims(self):
-        background = {**self.claim(), 'relevance': 'background'}
-        no_mention = {**self.claim(), 'statement': 'No information about lanthanum was found in this paper.'}
-        answer, claims = evidence.grounded_answer({'claims': [background, no_mention]}, self.sources, summaries=True)
-        self.assertEqual(claims, [])
-        self.assertNotIn('###', answer)
-        self.assertEqual(evidence.supporting_sources(self.sources, claims), [])
-
-    def test_measured_negative_findings_are_not_treated_as_absence_filler(self):
-        statement = 'Lanthanum did not significantly reduce grain size in this experiment.'
-        self.sources[0]['text'] = statement
-        claim = {**self.claim(1, statement), 'statement': statement}
-        answer, claims = evidence.grounded_answer({'claims': [claim]}, self.sources)
-        self.assertEqual(len(claims), 1)
-        self.assertIn(statement, answer)
 
 
 if __name__ == '__main__':

@@ -32,6 +32,12 @@ def cached_corpus(db, root, key, revision, valid_paths, evidence_version):
     return r.load_corpus(db, root, key)
 
 
+@st.cache_data(ttl=30, max_entries=64, show_spinner=False)
+def model_details(name, digest):
+    # Cache metadata only; inspecting a model does not load it into memory.
+    return r.Ollama().model_details(name)
+
+
 @st.cache_data(ttl=30, show_spinner=False)
 def ocr_languages():
     try:
@@ -120,7 +126,8 @@ with st.sidebar:
     limit_collection = st.checkbox('Limit to a Zotero collection')
     collection_controls = st.container()
     st.divider()
-    st.caption('Mistral 7B · Local answers\n\nNomic Embed · Local document search')
+    model_controls = st.container()
+    st.caption('Nomic Embed · Local document search')
     st.caption('The app reads PDFs without changing them. Its search index stays in this project’s .data folder.')
     st.caption('Zotero collections can limit your paper selection. Notes and annotations are not imported.')
 
@@ -177,15 +184,63 @@ if limit_collection:
 visible_paths = {str(p) for p in files}
 all_docs = [d for d in r.documents(root=root) if d['path'] in visible_paths]
 key, online, chat_ready = None, False, False
+models = {}
 try:
     models = client.models()
-    key = client.embedding_key()
     online = True
-    chat_ready = r.CHAT_MODEL in models
 except r.AssistantError as exc:
     st.warning(str(exc))
-if online and not chat_ready:
-    st.warning(f'The answer model is missing. Run: ollama pull {r.CHAT_MODEL}')
+
+with model_controls:
+    available_models = {}
+    for name, info in models.items():
+        try:
+            details = model_details(name, info.get('digest'))
+        except r.AssistantError:
+            st.caption(f'Could not inspect {name}. Refresh models to try again.')
+            continue
+        # Embedding models cannot answer questions. Cloud-backed models are
+        # excluded so changing this setting preserves local PDF processing.
+        if ('completion' in details.get('capabilities', [])
+                and not details.get('remote_model') and not details.get('remote_host')):
+            available_models[name] = info
+    choices = sorted(available_models, key=lambda name: (
+        name != r.CHAT_MODEL, name.casefold()))
+    previous_model = st.session_state.get('answer_model')
+    if previous_model and previous_model not in choices:
+        choices.insert(0, previous_model)
+    elif not previous_model and choices:
+        st.session_state['answer_model'] = choices[0]
+    selected_model = st.selectbox(
+        'Answer model', choices, key='answer_model', disabled=not online or not choices,
+        placeholder='No local answer models installed',
+        format_func=lambda name: name if name in available_models else f'{name} (unavailable)',
+        help='Choose an installed local Ollama model for new answers. Your paper index stays the same.')
+    chat_ready = selected_model in available_models
+    if st.button('Refresh models'):
+        model_details.clear()
+        st.rerun()
+    if online and not chat_ready:
+        st.warning('Choose an available answer model, or install one in Ollama and refresh this list.')
+    st.caption('Applies to new answers. Switching models does not require reindexing.')
+    if chat_ready:
+        size = available_models[selected_model].get('size')
+        if size:
+            st.caption(f'Model file: {size / 1e9:.1f} GB on disk')
+        try:
+            running = client.running_models().get(selected_model)
+            if running and isinstance(running.get('size'), (int, float)):
+                st.caption(f'Loaded model memory: {running["size"] / 1e9:.1f} GB (reported by Ollama). Other app memory is additional.')
+            else:
+                st.caption('Not loaded in memory. It will load when you ask a question.')
+        except r.AssistantError:
+            st.caption('Loaded memory is currently unavailable.')
+
+if online:
+    try:
+        key = client.embedding_key()
+    except r.AssistantError as exc:
+        st.warning(str(exc))
 ready = [d for d in all_docs if key and r.current_document(d) and r.index_compatible(d['embedding_key'], key)]
 
 st.title('Explore your research library')
@@ -306,7 +361,7 @@ with ask_tab:
     st.caption('Passages include surrounding text. Recognizable reference lists are excluded from answer evidence.')
     search_only = st.checkbox('Find passages without generating an answer')
     if not search_only:
-        st.caption('Only passages supporting the answer are shown. Papers without relevant findings are omitted.')
+        st.caption('Answers synthesize the retrieved excerpts. Expand the passages below an answer to check its citations.')
     st.caption('Ask each question with its full context. Earlier answers are displayed for reference but are not sent to the model.')
     if st.button('Clear conversation'):
         st.session_state['messages'] = []
@@ -317,6 +372,8 @@ with ask_tab:
         with st.chat_message('assistant'):
             if message.get('paper_selection'):
                 st.caption(f'Paper selection: {message["paper_selection"]}')
+            if message.get('answer_model'):
+                st.caption(f'Answer model: {message["answer_model"]}')
             st.markdown(message['answer'])
             citation_style = message.get('citation_style', 'passages')
             warning = r.citation_warning(message['answer'], message['sources'], citation_style) if message['sources'] and not message.get('search_only') else None
@@ -328,7 +385,16 @@ with ask_tab:
                     for support in message['grounding']:
                         st.markdown(f'**{support["citation"]}** {support["statement"]}')
                         st.text(support['quote'])
-            show_sources(message['sources'], f'history-{number}', citation_style)
+            if message.get('answer_mode') == 'prose' and message['sources']:
+                with st.expander('Passages supplied to the model'):
+                    st.caption('These are the search results the model received; it may use only some of them in its answer.')
+                    show_sources(message['sources'], f'history-{number}', citation_style)
+            else:
+                show_sources(message['sources'], f'history-{number}', citation_style)
+            if message.get('retrieved_sources'):
+                with st.expander('Inspect retrieved passages'):
+                    st.caption('These are search candidates. The model did not produce an answer that passed the source checks.')
+                    show_sources(message['retrieved_sources'], f'retrieved-{number}', r.CITATION_STYLE)
     question = st.chat_input('What do these papers say about…?', disabled=not ready or not online or (bool(scope_query.strip()) and not scope_matches) or (not chat_ready and not search_only), max_chars=2000)
     if question:
         try:
@@ -340,13 +406,12 @@ with ask_tab:
                 if group_id:
                     sources = [{**source, 'group_id': group_id} for source in sources]
             with st.spinner('Reading the evidence and drafting an answer locally…'):
-                answer = ('Here are the closest matching passages.' if sources else 'No passages found.') if search_only else client.answer(question, sources)
-                if not search_only:
-                    sources = client.answer_sources
+                answer = ('Here are the closest matching passages.' if sources else 'No passages found.') if search_only else client.answer(question, sources, model=selected_model)
             warning = r.citation_warning(answer, sources) if not search_only and sources else None
             messages.append({'question': question, 'answer': answer, 'sources': sources, 'warning': warning,
                              'search_only': search_only, 'paper_selection': scope_label,
-                             'grounding': getattr(client, 'answer_evidence', []) if not search_only else [],
+                             'answer_model': selected_model if not search_only else None,
+                             'answer_mode': 'search' if search_only else 'prose',
                              'citation_style': r.CITATION_STYLE})
             st.rerun()
         except r.AssistantError as exc:

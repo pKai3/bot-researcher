@@ -15,7 +15,18 @@ from test_zotero import collection, item
 
 class LocalModels:
     def models(self):
-        return {r.CHAT_MODEL: {}}
+        return {r.CHAT_MODEL: {'size': 4_400_000_000}, 'test-answer:14b': {},
+                r.EMBED_MODEL: {}, 'cloud-answer:cloud': {}}
+
+    def model_details(self, name):
+        if name == r.EMBED_MODEL:
+            return {'capabilities': ['embedding']}
+        if name == 'cloud-answer:cloud':
+            return {'capabilities': ['completion'], 'remote_host': 'https://ollama.com'}
+        return {'capabilities': ['completion']}
+
+    def running_models(self):
+        return {r.CHAT_MODEL: {'size': 6_700_000_000}}
 
     def embedding_key(self):
         return 'test-model'
@@ -135,17 +146,78 @@ class ScopeTests(unittest.TestCase):
         self.assertTrue(any(e.label == 'Check supporting quotes' for e in self.app.expander))
         self.assertTrue(any(t.value == 'Exact supporting text from the source.' for t in self.app.get('text')))
 
-    def test_answer_displays_only_the_sources_used_by_supported_claims(self):
-        def answer(client, question, sources):
-            client.answer_sources = sources[:1]
-            client.answer_evidence = []
-            return 'A supported finding [1, p. 1].'
+    def test_prose_answer_remains_visible_with_all_supplied_passages_available(self):
+        prose = 'An explanation with an unavailable page [2, p. 99].'
+
+        def answer(client, question, sources, model=r.CHAT_MODEL):
+            return prose
+
         with patch.object(LocalModels, 'answer', answer, create=True):
-            self.app.chat_input[0].set_value('What evidence answers this question?').run()
+            self.app.chat_input[0].set_value('Explain the evidence.').run()
         self.assertFalse(self.app.exception)
         message = self.app.session_state['messages'][-1]
-        self.assertEqual(len(message['sources']), 1)
-        self.assertEqual(len([e for e in self.app.expander if e.label.startswith('[')]), 1)
+        self.assertEqual(message['answer'], prose)
+        self.assertEqual(message['answer_mode'], 'prose')
+        self.assertEqual(len(message['sources']), 3)
+        self.assertTrue(any(m.value == prose for m in self.app.markdown))
+        self.assertTrue(any('page that was not supplied' in w.value for w in self.app.warning))
+        panels = [e for e in self.app.expander if e.label == 'Passages supplied to the model']
+        self.assertEqual(len(panels), 1)
+        self.assertFalse(panels[0].proto.expanded)
+        self.assertFalse(any(e.label == 'Check supporting quotes' for e in self.app.expander))
+
+    def test_model_selection_routes_new_answers_and_preserves_history(self):
+        self.assertEqual(self.widget('selectbox', 'Answer model').options, [r.CHAT_MODEL, 'test-answer:14b'])
+        self.assertTrue(any('6.7 GB' in c.value and 'Loaded model memory' in c.value for c in self.app.caption))
+        used = []
+
+        def answer(client, question, sources, model=r.CHAT_MODEL):
+            used.append(model)
+            return 'A finding [1, p. 1].'
+
+        with patch.object(LocalModels, 'answer', answer, create=True), patch('research.index_document') as index:
+            self.app.chat_input[0].set_value('First question').run()
+            self.widget('selectbox', 'Answer model').set_value('test-answer:14b').run()
+            self.app.chat_input[0].set_value('Second question').run()
+            index.assert_not_called()
+        self.assertFalse(self.app.exception)
+        self.assertEqual(used, [r.CHAT_MODEL, 'test-answer:14b'])
+        self.assertEqual([m['answer_model'] for m in self.app.session_state['messages']], used)
+        self.assertTrue(any(c.value == f'Answer model: {r.CHAT_MODEL}' for c in self.app.caption))
+        self.assertTrue(any(c.value == 'Answer model: test-answer:14b' for c in self.app.caption))
+
+    def test_removed_model_is_not_silently_replaced_and_search_still_works(self):
+        self.widget('selectbox', 'Answer model').set_value('test-answer:14b').run()
+        with patch.object(LocalModels, 'models', return_value={r.CHAT_MODEL: {}}):
+            self.app.run()
+            self.assertFalse(self.app.exception)
+            self.assertEqual(self.widget('selectbox', 'Answer model').value, 'test-answer:14b')
+            self.assertTrue(self.app.chat_input[0].disabled)
+            self.widget('checkbox', 'Find passages without generating an answer').check().run()
+            self.assertFalse(self.app.chat_input[0].disabled)
+            self.app.chat_input[0].set_value('Find the evidence').run()
+        self.assertFalse(self.app.exception)
+        self.assertIsNone(self.app.session_state['messages'][-1]['answer_model'])
+
+    def test_new_session_defaults_to_mistral_with_ministral_still_available(self):
+        with patch.object(LocalModels, 'models', return_value={r.CHAT_MODEL: {}, 'ministral-3:8b': {}}):
+            self.app = AppTest.from_file(str(Path(r.__file__).parent / 'app.py'), default_timeout=15).run()
+        self.assertFalse(self.app.exception)
+        self.assertEqual(self.widget('selectbox', 'Answer model').value, r.CHAT_MODEL)
+        self.assertIn('ministral-3:8b', self.widget('selectbox', 'Answer model').options)
+
+    def test_old_failed_answers_keep_their_saved_search_results(self):
+        self.app.session_state['messages'] = [{
+            'question': 'An earlier question', 'answer': 'The model draft failed the source checks.',
+            'sources': [], 'citation_style': r.CITATION_STYLE,
+            'retrieved_sources': [{'path': str(self.files[0]), 'page': 1, 'text': 'Earlier retrieved text.'}],
+        }]
+        self.app.run()
+        self.assertFalse(self.app.exception)
+        panels = [e for e in self.app.expander if e.label == 'Inspect retrieved passages']
+        self.assertEqual(len(panels), 1)
+        self.assertFalse(panels[0].proto.expanded)
+
 
 
 if __name__ == '__main__':
